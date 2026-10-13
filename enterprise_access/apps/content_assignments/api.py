@@ -15,6 +15,7 @@ from django.db.models.functions import Lower
 from django.utils import timezone
 
 from enterprise_access.apps.content_assignments.content_metadata_api import (
+    get_catalog_agnostic_content_metadata_for_assignment,
     get_content_metadata_for_assignments,
     is_date_n_days_from_now,
     parse_datetime_string
@@ -1330,6 +1331,42 @@ def nudge_assignments(assignments, assignment_configuration_uuid, days_before_co
     }
 
 
+def _expire_assignment_and_notify(assignment, credit_request, automatic_expiration_reason):
+    """
+    Writes for ``expire_assignment()``; must be called inside ``transaction.atomic()``.
+    """
+    assignment.state = LearnerContentAssignmentStateChoices.EXPIRED
+    assignment.expired_at = localized_utcnow()
+
+    # Note: clear_pii() is intentionally NOT called here to ensure expiration emails
+    # are sent to the actual learner email address. PII clearing is handled by a
+    # separate daily task (clear_pii_for_expired_assignments) that runs after
+    # expiration emails have been sent.
+
+    if credit_request:
+        logger.info('Modifying credit request %s to expired', credit_request.uuid)
+        credit_request.state = SubsidyRequestStates.EXPIRED
+        credit_request.save()
+
+    assignment.save()
+
+    # Record audit action for the automatic state transition (system-driven).
+    assignment.add_audit_action(
+        action_type=AssignmentActions.EXPIRED,
+        actor_type=AssignmentActorTypes.SYSTEM,
+        source=AssignmentSources.SCHEDULED_JOB,
+        metadata={'expiration_reason': automatic_expiration_reason},
+    )
+
+    # Send appropriate expiration email based on whether this is a B&R request or regular assignment
+    if credit_request:
+        # This is a Browse & Request - send B&R-specific expiration email
+        send_bnr_automatically_expired_email.delay(credit_request.uuid)
+    else:
+        # This is a regular assignment - send assignment expiration email
+        send_assignment_automatically_expired_email.delay(assignment.uuid)
+
+
 def expire_assignment(
     assignment: LearnerContentAssignment,
     content_metadata: dict,
@@ -1343,10 +1380,14 @@ def expire_assignment(
         logger.info('Cannot expire accepted assignment %s', assignment.uuid)
         return None
 
+    # Content that has left the policy's catalog (the usual case once its last run ends) has no metadata
+    # there, so look up the course run dates catalog-agnostically. This synchronous catalog call is made only
+    # on this nightly path, not by the API serializer or Braze reminders.
+    course_run_metadata = content_metadata or get_catalog_agnostic_content_metadata_for_assignment(assignment)
     automatic_expiration_date_and_reason = get_automatic_expiration_date_and_reason(
         assignment,
         content_metadata,
-        use_catalog_agnostic_fallback=True,
+        course_run_metadata=course_run_metadata,
     )
     automatic_expiration_date = automatic_expiration_date_and_reason['date']
     automatic_expiration_reason = automatic_expiration_date_and_reason['reason']
@@ -1364,37 +1405,23 @@ def expire_assignment(
 
     if modify_assignment:
         logger.info('Modifying assignment %s to expired', assignment.uuid)
-        assignment.state = LearnerContentAssignmentStateChoices.EXPIRED
-        assignment.expired_at = localized_utcnow()
-
-        # Note: clear_pii() is intentionally NOT called here to ensure expiration emails
-        # are sent to the actual learner email address. PII clearing is handled by a
-        # separate daily task (clear_pii_for_expired_assignments) that runs after
-        # expiration emails have been sent.
-
         credit_request = getattr(assignment, 'credit_request', None)
 
-        if credit_request:
-            logger.info('Modifying credit request %s to expired', credit_request.uuid)
-            credit_request.state = SubsidyRequestStates.EXPIRED
-            credit_request.save()
-
-        assignment.save()
-
-        # Record audit action for the automatic state transition (system-driven).
-        assignment.add_audit_action(
-            action_type=AssignmentActions.EXPIRED,
-            actor_type=AssignmentActorTypes.SYSTEM,
-            source=AssignmentSources.SCHEDULED_JOB,
-            metadata={'expiration_reason': automatic_expiration_reason},
-        )
-
-        # Send appropriate expiration email based on whether this is a B&R request or regular assignment
-        if credit_request:
-            # This is a Browse & Request - send B&R-specific expiration email
-            send_bnr_automatically_expired_email.delay(credit_request.uuid)
-        else:
-            # This is a regular assignment - send assignment expiration email
-            send_assignment_automatically_expired_email.delay(assignment.uuid)
+        # The state change, audit action and email scheduling succeed or fail together. If any write or the
+        # broker call fails, the transaction rolls back and the assignment stays in an expirable state, so
+        # the next nightly run retries it instead of leaving an EXPIRED assignment that never gets an email.
+        # The email is queued last: a broker failure leaves nothing to undo, and the only residual window
+        # (the commit itself failing after a successful enqueue) risks one duplicate email, never a lost one.
+        original_state, original_expired_at = assignment.state, assignment.expired_at
+        original_credit_request_state = credit_request.state if credit_request else None
+        try:
+            with transaction.atomic():
+                _expire_assignment_and_notify(assignment, credit_request, automatic_expiration_reason)
+        except Exception:
+            # The rollback only restores the database; keep the in-memory objects consistent with it.
+            assignment.state, assignment.expired_at = original_state, original_expired_at
+            if credit_request:
+                credit_request.state = original_credit_request_state
+            raise
 
     return automatic_expiration_reason

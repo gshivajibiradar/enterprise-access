@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from django.core.management import CommandError, call_command
+from django.db import DatabaseError
 from django.utils import timezone
 
 from enterprise_access.apps.content_assignments.constants import (
@@ -68,7 +69,7 @@ class TestAutomaticallyExpireAssignmentCommand(TestCase):
         )
 
     @mock.patch(
-        'enterprise_access.apps.content_assignments.content_metadata_api.'
+        'enterprise_access.apps.content_assignments.api.'
         'get_catalog_agnostic_content_metadata_for_assignment'
     )
     @mock.patch('enterprise_access.apps.content_metadata.api.EnterpriseCatalogApiClient')
@@ -239,7 +240,7 @@ class TestAutomaticallyExpireAssignmentCommand(TestCase):
         assert any(str(self.alice_assignment.uuid) in line for line in logs.output)
 
     @mock.patch(
-        'enterprise_access.apps.content_assignments.content_metadata_api.'
+        'enterprise_access.apps.content_assignments.api.'
         'get_catalog_agnostic_content_metadata_for_assignment'
     )
     @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email.delay')
@@ -297,3 +298,117 @@ class TestAutomaticallyExpireAssignmentCommand(TestCase):
         assert expired_action.metadata['expiration_reason'] == AssignmentAutomaticExpiredReason.COURSE_RUN_ENDED
         self.alice_assignment.refresh_from_db()
         assert self.alice_assignment.state == LearnerContentAssignmentStateChoices.ALLOCATED
+
+    def _make_both_assignments_expirable(self):
+        for assignment in (self.alice_assignment, self.bob_assignment):
+            assignment.created = timezone.now() - timezone.timedelta(days=100)
+            assignment.allocated_at = timezone.now() - timezone.timedelta(days=100)
+            assignment.save()
+
+    @staticmethod
+    def _scheduled_expiration_actions(assignment):
+        return assignment.actions.filter(action_type='expired', source='scheduled_job')
+
+    @mock.patch(
+        'enterprise_access.apps.content_assignments.api.'
+        'get_catalog_agnostic_content_metadata_for_assignment',
+        return_value={},
+    )
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email.delay')
+    @mock.patch('enterprise_access.apps.content_metadata.api.EnterpriseCatalogApiClient')
+    @mock.patch('enterprise_access.apps.subsidy_access_policy.models.SubsidyAccessPolicy.subsidy_client')
+    def test_email_scheduling_failure_leaves_assignment_retryable_and_others_proceed(
+        self,
+        mock_subsidy_client,
+        mock_catalog_client,
+        mock_send_expired_email,
+        mock_catalog_agnostic_metadata,  # pylint: disable=unused-argument
+    ):
+        """
+        Uses the real ``expire_assignment()``: only the broker call fails, for alice. Her state change and audit
+        action (already written when the broker call is made) must roll back, bob must still be expired, the
+        command must exit non-zero, and the next run must expire alice exactly once.
+        """
+        self._make_both_assignments_expirable()
+        mock_subsidy_client.retrieve_subsidy.return_value = {
+            'enterprise_customer_uuid': str(self.enterprise_uuid),
+            'expiration_datetime': (timezone.now() + timezone.timedelta(days=100)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'is_active': True,
+        }
+        mock_catalog_client.return_value.catalog_content_metadata.return_value = {'count': 0, 'results': []}
+
+        def send_side_effect(assignment_uuid):
+            if assignment_uuid == self.alice_assignment.uuid:
+                raise ConnectionError('broker down')
+
+        mock_send_expired_email.side_effect = send_side_effect
+
+        with self.assertLogs(COMMAND_PATH, level='ERROR') as logs:
+            with pytest.raises(CommandError, match='Failed to expire 1 assignments'):
+                call_command(self.command)
+
+        assert any(str(self.alice_assignment.uuid) in line for line in logs.output)
+        self.alice_assignment.refresh_from_db()
+        self.bob_assignment.refresh_from_db()
+        # alice: no EXPIRED state without the audit action / email, and still expirable
+        assert self.alice_assignment.state == LearnerContentAssignmentStateChoices.ALLOCATED
+        assert self.alice_assignment.expired_at is None
+        assert not self._scheduled_expiration_actions(self.alice_assignment).exists()
+        # bob: state, audit action and email are all consistent
+        assert self.bob_assignment.state == LearnerContentAssignmentStateChoices.EXPIRED
+        assert self._scheduled_expiration_actions(self.bob_assignment).count() == 1
+        mock_send_expired_email.assert_any_call(self.bob_assignment.uuid)
+
+        # Broker recovers: the next nightly run retries alice only and succeeds (exit status 0).
+        mock_send_expired_email.reset_mock(side_effect=True)
+        call_command(self.command)
+
+        self.alice_assignment.refresh_from_db()
+        assert self.alice_assignment.state == LearnerContentAssignmentStateChoices.EXPIRED
+        assert self._scheduled_expiration_actions(self.alice_assignment).count() == 1
+        assert self._scheduled_expiration_actions(self.bob_assignment).count() == 1
+        mock_send_expired_email.assert_called_once_with(self.alice_assignment.uuid)
+
+    @mock.patch(
+        'enterprise_access.apps.content_assignments.api.'
+        'get_catalog_agnostic_content_metadata_for_assignment',
+        return_value={},
+    )
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email.delay')
+    @mock.patch('enterprise_access.apps.content_metadata.api.EnterpriseCatalogApiClient')
+    @mock.patch('enterprise_access.apps.subsidy_access_policy.models.SubsidyAccessPolicy.subsidy_client')
+    def test_database_failure_mid_expiration_is_rolled_back_and_reported(
+        self,
+        mock_subsidy_client,
+        mock_catalog_client,
+        mock_send_expired_email,
+        mock_catalog_agnostic_metadata,  # pylint: disable=unused-argument
+    ):
+        """
+        A real partial write: alice's ``assignment.save()`` succeeds and the audit-action insert then fails.
+        Her state change must not survive, no email may be queued for her, and bob is still processed.
+        """
+        self._make_both_assignments_expirable()
+        mock_subsidy_client.retrieve_subsidy.return_value = {
+            'enterprise_customer_uuid': str(self.enterprise_uuid),
+            'expiration_datetime': (timezone.now() + timezone.timedelta(days=100)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'is_active': True,
+        }
+        mock_catalog_client.return_value.catalog_content_metadata.return_value = {'count': 0, 'results': []}
+
+        original_add_audit_action = LearnerContentAssignment.add_audit_action
+
+        def failing_add_audit_action(assignment, *args, **kwargs):
+            if assignment.uuid == self.alice_assignment.uuid:
+                raise DatabaseError('insert failed')
+            return original_add_audit_action(assignment, *args, **kwargs)
+
+        with mock.patch.object(LearnerContentAssignment, 'add_audit_action', failing_add_audit_action):
+            with pytest.raises(CommandError, match='Failed to expire 1 assignments'):
+                call_command(self.command)
+
+        self.alice_assignment.refresh_from_db()
+        self.bob_assignment.refresh_from_db()
+        assert self.alice_assignment.state == LearnerContentAssignmentStateChoices.ALLOCATED
+        assert self.bob_assignment.state == LearnerContentAssignmentStateChoices.EXPIRED
+        mock_send_expired_email.assert_called_once_with(self.bob_assignment.uuid)

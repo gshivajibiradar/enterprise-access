@@ -133,7 +133,7 @@ def get_automatic_expiration_date_and_reason(
     assignment,
     content_metadata: dict = None,
     *,
-    use_catalog_agnostic_fallback: bool = False,
+    course_run_metadata: dict = None,
     include_course_run_end: bool = True,
 ):
     """
@@ -150,20 +150,18 @@ def get_automatic_expiration_date_and_reason(
         assignment (LearnerContentAssignment): The assignment to check for expiration.
         [content_metadata] (dict): Content metadata for the assignment's content key. If not provided, it will be
             fetched and subsequently cached from the content metadata API.
-        [use_catalog_agnostic_fallback] (bool): Whether to fall back to a catalog-/customer-agnostic content
-            metadata lookup when the assignment's policy catalog has no metadata for the content. This makes a
-            synchronous call to enterprise-catalog, so it should only be set for the automatic-expiration path,
-            not for read endpoints or other callers of this function.
+        [course_run_metadata] (dict): Content metadata used only to find the course run end date, for callers that
+            resolved it from somewhere other than the policy catalog (e.g. the nightly expiration job, via
+            ``get_catalog_agnostic_content_metadata_for_assignment``, for content that has left the catalog).
+            Defaults to ``content_metadata``. Never used for the enrollment deadline, so this function itself
+            makes no extra network calls.
         [include_course_run_end] (bool): Whether the course run end date competes as an expiration date. Set to
             False to reproduce how legacy assignments (expired before the reason was recorded on the audit
             action) were evaluated before COURSE_RUN_ENDED existed.
     """
     # Import here to avoid circular import
     # pylint: disable=import-outside-toplevel
-    from enterprise_access.apps.content_assignments.content_metadata_api import (
-        get_catalog_agnostic_content_metadata_for_assignment,
-        get_content_metadata_for_assignments
-    )
+    from enterprise_access.apps.content_assignments.content_metadata_api import get_content_metadata_for_assignments
 
     assignment_configuration = assignment.assignment_configuration
     # pylint: disable=no-member,useless-suppression
@@ -181,12 +179,10 @@ def get_automatic_expiration_date_and_reason(
         )
         content_metadata = content_metadata_by_key.get(content_key)
 
-    # The catalog-agnostic fallback is only used to learn when course runs ended. The enrollment deadline
-    # always comes from the policy catalog's metadata, so content that left the catalog is not expired
-    # as ENROLLMENT_DATE_PASSED (which would never get its PII cleared).
-    course_run_metadata = content_metadata
-    if not course_run_metadata and use_catalog_agnostic_fallback:
-        course_run_metadata = get_catalog_agnostic_content_metadata_for_assignment(assignment)
+    # The enrollment deadline always comes from the policy catalog's metadata, so content that left the catalog
+    # is not expired as ENROLLMENT_DATE_PASSED (which would never get its PII cleared).
+    if not course_run_metadata:
+        course_run_metadata = content_metadata
 
     enrollment_deadline_datetime = _get_enrollment_deadline_date(assignment, content_metadata)
     if enrollment_deadline_datetime:

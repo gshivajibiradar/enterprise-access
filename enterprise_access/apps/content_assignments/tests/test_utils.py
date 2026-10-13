@@ -434,10 +434,11 @@ class TestGetLatestCourseRunEndDate(TestCase):
 
 
 @ddt.ddt
-class TestCatalogAgnosticFallback(TestCase):
+class TestCourseRunMetadataParameter(TestCase):
     """
-    ``use_catalog_agnostic_fallback`` gates the synchronous catalog-agnostic lookup, and the fallback
-    metadata may only inform the course-run-ended date, never the enrollment deadline.
+    ``course_run_metadata`` lets the nightly expiration job supply course run dates for content missing from the
+    policy catalog. It may only inform the course-run-ended date, never the enrollment deadline, and
+    ``get_automatic_expiration_date_and_reason`` itself must never make a catalog-agnostic lookup.
     """
 
     @staticmethod
@@ -450,39 +451,40 @@ class TestCatalogAgnosticFallback(TestCase):
             get_allocation_timeout_expiration=lambda: datetime.now(UTC) + timedelta(days=90),
         )
 
-    def _get_expiration(self, fallback_metadata, use_fallback=True):
+    def _get_expiration(self, course_run_metadata=None, **kwargs):
         """
         Run get_automatic_expiration_date_and_reason for content missing from the policy catalog.
-        Returns (result, fallback mock).
+        Returns (result, catalog-agnostic lookup mock).
         """
         fallback_path = f'{CONTENT_METADATA_API_MODULE}.get_catalog_agnostic_content_metadata_for_assignment'
         with mock.patch(f'{UTILS_MODULE}._get_subsidy_expiration', return_value=None), \
              mock.patch(f'{CONTENT_METADATA_API_MODULE}.get_content_metadata_for_assignments', return_value={}), \
-             mock.patch(fallback_path, return_value=fallback_metadata) as mock_fallback:
+             mock.patch(fallback_path) as mock_fallback:
             result = get_automatic_expiration_date_and_reason(
                 self._fake_assignment(),
-                use_catalog_agnostic_fallback=use_fallback,
+                course_run_metadata=course_run_metadata,
+                **kwargs,
             )
         return result, mock_fallback
 
     @ddt.data(
-        (False, False, AssignmentAutomaticExpiredReason.NINETY_DAYS_PASSED),
-        (True, True, AssignmentAutomaticExpiredReason.COURSE_RUN_ENDED),
+        (False, AssignmentAutomaticExpiredReason.NINETY_DAYS_PASSED),
+        (True, AssignmentAutomaticExpiredReason.COURSE_RUN_ENDED),
     )
     @ddt.unpack
-    def test_fallback_only_used_when_flag_set(self, use_fallback, expect_fallback_called, expected_reason):
+    def test_course_run_metadata_only_used_when_supplied(self, supply_metadata, expected_reason):
         ended_metadata = {
             'normalized_metadata': {'enroll_by_date': None},
             'normalized_metadata_by_run': {RUN_1: {'end_date': _iso(-1)}},
         }
-        result, mock_fallback = self._get_expiration(ended_metadata, use_fallback=use_fallback)
+        result, mock_fallback = self._get_expiration(ended_metadata if supply_metadata else None)
 
-        assert mock_fallback.called is expect_fallback_called
+        assert not mock_fallback.called
         assert result['reason'] == expected_reason
 
-    def test_fallback_metadata_enroll_by_date_is_ignored(self):
+    def test_course_run_metadata_enroll_by_date_is_ignored(self):
         """
-        A past ``enroll_by_date`` in the fallback metadata must not win over the course run end date,
+        A past ``enroll_by_date`` in the supplied course run metadata must not win over the course run end date,
         otherwise the assignment would expire as ENROLLMENT_DATE_PASSED and never have its PII cleared.
         """
         ended_metadata = {
@@ -492,3 +494,10 @@ class TestCatalogAgnosticFallback(TestCase):
         result, _ = self._get_expiration(ended_metadata)
 
         assert result['reason'] == AssignmentAutomaticExpiredReason.COURSE_RUN_ENDED
+
+    def test_include_course_run_end_false_ignores_course_run_metadata(self):
+        """The legacy recomputation path (PII clearing) must not let a course run end date win."""
+        ended_metadata = {'normalized_metadata_by_run': {RUN_1: {'end_date': _iso(-1)}}}
+        result, _ = self._get_expiration(ended_metadata, include_course_run_end=False)
+
+        assert result['reason'] == AssignmentAutomaticExpiredReason.NINETY_DAYS_PASSED

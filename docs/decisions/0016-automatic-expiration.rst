@@ -64,7 +64,24 @@ Details that affect which assignments have PII cleared:
   metadata, so such assignments expire as ``COURSE_RUN_ENDED`` (and have PII cleared) rather than as
   ``ENROLLMENT_DATE_PASSED``.
 * No backfill is required: the daily ``automatically_expire_assignments`` job evaluates existing
-  ``ALLOCATED`` assignments with the new rule.
+  ``ALLOCATED`` assignments with the new rule. Assignments that already expired before this change are not
+  re-evaluated; their PII eligibility follows the legacy rules above.
+* Expiring an assignment is atomic: the state change, the credit request update, the ``scheduled_job`` audit
+  action and the queuing of the expiration email succeed or fail together. If any of them fails (for example the
+  Celery broker is down), everything is rolled back and the assignment stays ``ALLOCATED``, so the next nightly
+  run retries it. The command keeps processing other assignments, then exits non-zero (``CommandError``) listing
+  the ones that failed. The one residual window is the commit itself failing after the email was queued, which
+  can cause a duplicate email on the retry but never a missing one.
+
+Pending product sign-off
+------------------------
+The following consequences of this amendment are irreversible (PII clearing cannot be undone) and have **not**
+yet been approved by product. The change should not ship until they are:
+
+* PII is cleared earlier (right after the last course run ends) for assignments that used to expire at day 90.
+* PII is now cleared for assignments that, before this change, expired as ``SUBSIDY_EXPIRED`` and kept their
+  email indefinitely, whenever all course runs ended before the subsidy did.
+* Course-level assignments expire once all *known* runs have ended, even if a new run might be announced later.
 
 Consequences
 ============

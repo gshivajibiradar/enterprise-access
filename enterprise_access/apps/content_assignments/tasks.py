@@ -734,19 +734,22 @@ def _get_expiration_action_info(assignments):
     Returns:
         tuple: (set of assignment ids that have a successful "expiration email sent" action,
                 dict of assignment id -> ``expiration_reason`` recorded by ``expire_assignment()``).
-                Mirrors ``get_last_successful_expiration_action``.
+                The email lookup shares ``LearnerContentAssignmentAction.filter_successful_expiration_email_actions``
+                with ``get_last_successful_expiration_action``.
     """
-    emailed_assignment_ids = set()
+    actions = LearnerContentAssignmentAction.objects.filter(assignment__in=assignments)
+    emailed_assignment_ids = set(
+        LearnerContentAssignmentAction.filter_successful_expiration_email_actions(actions).values_list(
+            'assignment_id', flat=True,
+        )
+    )
     recorded_reasons = {}
-    expired_actions = LearnerContentAssignmentAction.objects.filter(
-        assignment__in=assignments,
+    scheduled_expirations = actions.filter(
         action_type=AssignmentActions.EXPIRED,
-    ).order_by('completed_at').values('assignment_id', 'source', 'error_reason', 'metadata')
-    for action in expired_actions:
-        if action['source'] == AssignmentSources.SCHEDULED_JOB:
-            recorded_reasons[action['assignment_id']] = (action['metadata'] or {}).get('expiration_reason')
-        elif action['error_reason'] is None:
-            emailed_assignment_ids.add(action['assignment_id'])
+        source=AssignmentSources.SCHEDULED_JOB,
+    ).order_by('completed_at', 'created').values('assignment_id', 'metadata')
+    for action in scheduled_expirations:
+        recorded_reasons[action['assignment_id']] = (action['metadata'] or {}).get('expiration_reason')
     return emailed_assignment_ids, recorded_reasons
 
 
@@ -859,13 +862,21 @@ def clear_pii_for_expired_assignments(dry_run=False):
             )
             continue
 
-        # Fetch content metadata for all assignments in batch
-        content_metadata_for_assignments = get_content_metadata_for_assignments(
-            enterprise_catalog_uuid,
-            expired_assignments
-        )
-
+        expired_assignments = list(expired_assignments)
         emailed_assignment_ids, recorded_reasons = _get_expiration_action_info(expired_assignments)
+
+        # Content metadata (a policy-catalog lookup) is only needed to recompute the expiration reason of
+        # legacy rows that were emailed but have no recorded reason; everything else is decided from audit rows.
+        assignments_needing_metadata = [
+            assignment for assignment in expired_assignments
+            if assignment.uuid in emailed_assignment_ids and not recorded_reasons.get(assignment.uuid)
+        ]
+        content_metadata_for_assignments = {}
+        if assignments_needing_metadata:
+            content_metadata_for_assignments = get_content_metadata_for_assignments(
+                enterprise_catalog_uuid,
+                assignments_needing_metadata,
+            )
 
         for assignment in expired_assignments:
             content_metadata = content_metadata_for_assignments.get(assignment.content_key, {})

@@ -1419,12 +1419,16 @@ class TestClearPiiForExpiredAssignmentsTask(APITestWithMocks):
         }
         mock_catalog_client.return_value.catalog_content_metadata.return_value = {'count': 0, 'results': []}
 
-        clear_pii_for_expired_assignments(dry_run=True)
+        result = clear_pii_for_expired_assignments(dry_run=True)
 
+        # The assignment was eligible (reported as cleared), yet nothing was actually changed.
+        assert result['cleared_count'] == 1
+        assert result['assignment_uuids_cleared'] == [str(assignment.uuid)]
         assignment.refresh_from_db()
         assert assignment.learner_email == 'dry-run@test.com'
+        assert not assignment.actions.filter(action_type=AssignmentActions.RETIRED).exists()
 
-    def _make_expired_assignment(self, email, recorded_reason):
+    def _make_expired_assignment(self, email, recorded_reason, lms_user_id=TEST_LMS_USER_ID_2):
         """
         Helper: an expired assignment with a sent expiration email and the system audit action that
         ``expire_assignment()`` records at expiry time, carrying ``recorded_reason``.
@@ -1432,7 +1436,7 @@ class TestClearPiiForExpiredAssignmentsTask(APITestWithMocks):
         assignment = LearnerContentAssignmentFactory(
             assignment_configuration=self.assignment_configuration,
             learner_email=email,
-            lms_user_id=TEST_LMS_USER_ID_2,
+            lms_user_id=lms_user_id,
             content_key=TEST_COURSE_KEY,
             content_title='Test Course',
             content_quantity=-100,
@@ -1482,6 +1486,53 @@ class TestClearPiiForExpiredAssignmentsTask(APITestWithMocks):
 
         assignment.refresh_from_db()
         assert (assignment.learner_email != original_email) is expect_cleared
+
+    @mock.patch('enterprise_access.apps.content_assignments.tasks.get_content_metadata_for_assignments')
+    @mock.patch('enterprise_access.apps.subsidy_access_policy.models.SubsidyAccessPolicy.subsidy_client')
+    def test_clear_pii_skips_catalog_lookup_when_reason_recorded_or_no_email(
+        self, mock_subsidy_client, mock_get_metadata,
+    ):
+        """
+        The policy-catalog metadata lookup is only for legacy rows needing recomputation. Rows with a recorded
+        reason, and rows that were never emailed, are decided from audit actions alone.
+        """
+        mock_subsidy_client.retrieve_subsidy.return_value = {'is_active': True}
+        recorded = self._make_expired_assignment('recorded@test.com', AssignmentAutomaticExpiredReason.COURSE_RUN_ENDED)
+        # self.expired_assignment (from setUp) has no expiration email action at all.
+
+        result = clear_pii_for_expired_assignments(dry_run=False)
+
+        mock_get_metadata.assert_not_called()
+        assert result['assignment_uuids_cleared'] == [str(recorded.uuid)]
+
+    @mock.patch('enterprise_access.apps.content_assignments.content_metadata_api.get_content_metadata_for_assignments')
+    @mock.patch('enterprise_access.apps.content_assignments.tasks.get_content_metadata_for_assignments')
+    @mock.patch('enterprise_access.apps.subsidy_access_policy.models.SubsidyAccessPolicy.subsidy_client')
+    def test_clear_pii_looks_up_catalog_only_for_legacy_rows(
+        self, mock_subsidy_client, mock_get_metadata, mock_utils_get_metadata,
+    ):
+        """Only the emailed row with no recorded reason is passed to the metadata lookup, and it still clears."""
+        mock_subsidy_client.retrieve_subsidy.return_value = {
+            'enterprise_customer_uuid': str(self.enterprise_uuid),
+            'expiration_datetime': (now() + timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            'is_active': True,
+        }
+        mock_get_metadata.return_value = {}
+        mock_utils_get_metadata.return_value = {}  # the recomputation's own lookup, for the empty metadata
+        recorded = self._make_expired_assignment('recorded@test.com', AssignmentAutomaticExpiredReason.SUBSIDY_EXPIRED)
+        legacy = self._make_expired_assignment('legacy2@test.com', None, lms_user_id=TEST_LMS_USER_ID_2 + 100)
+        legacy.actions.filter(action_type=AssignmentActions.EXPIRED, source=AssignmentSources.SCHEDULED_JOB).delete()
+
+        result = clear_pii_for_expired_assignments(dry_run=False)
+
+        mock_get_metadata.assert_called_once()
+        looked_up = mock_get_metadata.call_args.args[1]
+        assert [a.uuid for a in looked_up] == [legacy.uuid]
+        # no metadata + future subsidy => legacy recomputation yields NINETY_DAYS_PASSED => cleared;
+        # the recorded SUBSIDY_EXPIRED row is not.
+        assert result['assignment_uuids_cleared'] == [str(legacy.uuid)]
+        recorded.refresh_from_db()
+        assert recorded.learner_email == 'recorded@test.com'
 
     @mock.patch('enterprise_access.apps.content_metadata.api.EnterpriseCatalogApiClient')
     @mock.patch('enterprise_access.apps.subsidy_access_policy.models.SubsidyAccessPolicy.subsidy_client')

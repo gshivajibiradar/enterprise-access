@@ -114,6 +114,15 @@ Uses `edx-rbac` for fine-grained permissions with:
 - A degraded mode (unscoped search) requires both a settings flag and an explicit call-site
   argument, and is never reached by fallback — missing or expired scoping raises
 
+### 18. Multi-write state transitions that also queue a Celery task: atomic, task last
+
+When a job changes state, writes an audit row and then queues a Celery task (e.g. `expire_assignment()`), wrap
+all of it in `transaction.atomic()` and call `.delay()` last. A broker failure then rolls everything back and the
+record stays in a state the next scheduled run will pick up again. Without this, the record is left in its final
+state with no task queued, and nothing ever retries it. Restore any in-memory model attributes you mutated when
+the block fails, since the rollback only restores the database. Prefer this over `transaction.on_commit()` alone,
+which would lose the task if the broker is down after the commit.
+
 ### Key Takeaways for Implementation:
 - Check permissions early using `@permission_required` decorator
 - Use separate serializers for request/response

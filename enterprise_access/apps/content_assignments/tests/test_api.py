@@ -5,6 +5,7 @@ from unittest import mock
 from uuid import uuid4
 
 import ddt
+from django.db import DatabaseError
 from django.test import TestCase
 from django.utils import timezone
 
@@ -1711,6 +1712,117 @@ class TestAssignmentExpiration(TestCase):
         assert action.error_reason is None
 
         assert assignment.get_last_successful_expiration_action() is None
+
+    def _expirable_assignment(self, **kwargs):
+        """An ALLOCATED assignment old enough to expire as NINETY_DAYS_PASSED."""
+        return LearnerContentAssignmentFactory.create(
+            assignment_configuration=self.assignment_configuration,
+            state=LearnerContentAssignmentStateChoices.ALLOCATED,
+            learner_email='rollback@example.com',
+            lms_user_id=12345,
+            allocated_at=delta_t(days=-(NUM_DAYS_BEFORE_AUTO_EXPIRATION + 1)),
+            **kwargs,
+        )
+
+    def _expire(self, assignment):
+        mock_subsidy_record = {'expiration_datetime': delta_t(days=100, as_string=True)}
+        with mock.patch.object(type(self.policy), 'subsidy_record', return_value=mock_subsidy_record):
+            return expire_assignment(
+                assignment,
+                content_metadata=self.mock_content_metadata('edX+DemoX', 'course-v1:edX+DemoX+T2024', None),
+                modify_assignment=True,
+            )
+
+    def _assert_nothing_persisted(self, assignment, credit_request=None):
+        """Assert a rolled-back expiration left the assignment (and credit request) untouched in the database."""
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.state, LearnerContentAssignmentStateChoices.ALLOCATED)
+        self.assertIsNone(assignment.expired_at)
+        self.assertFalse(assignment.actions.filter(action_type=AssignmentActions.EXPIRED).exists())
+        if credit_request:
+            credit_request.refresh_from_db()
+            self.assertNotEqual(credit_request.state, SubsidyRequestStates.EXPIRED)
+
+    @ddt.data(False, True)
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_bnr_automatically_expired_email')
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email')
+    def test_email_scheduling_failure_rolls_back_expiration(
+        self, with_credit_request, mock_expired_email, mock_bnr_expired_email,
+    ):
+        """
+        If the broker is down when the email is queued, the state change, credit request update and audit
+        action (all already written by then) are rolled back, so the next nightly run retries the assignment.
+        """
+        assignment = self._expirable_assignment()
+        credit_request = LearnerCreditRequestFactory.create(assignment=assignment) if with_credit_request else None
+        mock_expired_email.delay.side_effect = ConnectionError('broker down')
+        mock_bnr_expired_email.delay.side_effect = ConnectionError('broker down')
+
+        with self.assertRaises(ConnectionError):
+            self._expire(assignment)
+
+        self._assert_nothing_persisted(assignment, credit_request)
+
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email')
+    def test_audit_action_write_failure_rolls_back_assignment_save(self, mock_expired_email):
+        """
+        Reproduces a real partial write: ``assignment.save()`` has already hit the database when the audit
+        action insert fails. Neither the state change nor the email may survive.
+        """
+        assignment = self._expirable_assignment()
+
+        with mock.patch.object(
+            LearnerContentAssignmentAction.objects.__class__, 'create', side_effect=DatabaseError('insert failed'),
+        ):
+            with self.assertRaises(DatabaseError):
+                self._expire(assignment)
+
+        self._assert_nothing_persisted(assignment)
+        mock_expired_email.delay.assert_not_called()
+
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email')
+    def test_expiration_is_retried_cleanly_after_a_failed_attempt(self, mock_expired_email):
+        """After a rolled-back attempt, the retry expires once: one audit action and one email."""
+        assignment = self._expirable_assignment()
+        mock_expired_email.delay.side_effect = ConnectionError('broker down')
+        with self.assertRaises(ConnectionError):
+            self._expire(assignment)
+
+        # The in-memory object must have been restored too, or the retry would be skipped as already expired.
+        self.assertEqual(assignment.state, LearnerContentAssignmentStateChoices.ALLOCATED)
+        mock_expired_email.delay.side_effect = None
+        self._expire(assignment)
+
+        assignment.refresh_from_db()
+        self.assertEqual(assignment.state, LearnerContentAssignmentStateChoices.EXPIRED)
+        self.assertEqual(
+            assignment.actions.filter(
+                action_type=AssignmentActions.EXPIRED, source=AssignmentSources.SCHEDULED_JOB,
+            ).count(),
+            1,
+        )
+        self.assertEqual(mock_expired_email.delay.call_count, 2)  # failed attempt + successful retry
+
+    @mock.patch('enterprise_access.apps.content_assignments.api.get_catalog_agnostic_content_metadata_for_assignment')
+    @mock.patch('enterprise_access.apps.content_assignments.api.send_assignment_automatically_expired_email')
+    def test_catalog_agnostic_lookup_only_when_policy_catalog_has_no_metadata(
+        self, mock_expired_email, mock_agnostic_lookup,  # pylint: disable=unused-argument
+    ):
+        mock_agnostic_lookup.return_value = {}
+        assignment = self._expirable_assignment()
+        self._expire(assignment)  # policy catalog metadata supplied: no extra lookup
+        mock_agnostic_lookup.assert_not_called()
+
+        other = self._expirable_assignment()
+        mock_subsidy_record = {'expiration_datetime': delta_t(days=100, as_string=True)}
+        with mock.patch.object(
+            type(self.policy), 'subsidy_record', return_value=mock_subsidy_record,
+        ), mock.patch(
+            'enterprise_access.apps.content_assignments.content_metadata_api.get_content_metadata_for_assignments',
+            return_value={},
+        ):
+            expire_assignment(other, content_metadata={}, modify_assignment=True)
+        mock_agnostic_lookup.assert_called_once_with(other)
 
 
 class AllocateAssignmentForRequestsTests(TestCase):
